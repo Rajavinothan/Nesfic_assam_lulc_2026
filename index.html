@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LandWatch Assam</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600;700&family=Source+Serif+4:wght@600&display=swap" rel="stylesheet">
+<style>
+:root{--ink:#17232b;--muted:#5d6b73;--line:#d5dde1;--bg:#f6f8f9;--river:#0b5c7a;--alert:#c8321f;--font:"Source Sans 3",system-ui,sans-serif}
+*{box-sizing:border-box}html,body{height:100%;margin:0}
+body{font-family:var(--font);color:var(--ink);display:grid;grid-template-columns:350px 1fr;background:var(--bg)}
+aside{padding:20px;overflow-y:auto;border-right:1px solid var(--line);background:#fff}
+h1{font:600 1.5rem "Source Serif 4",Georgia,serif;margin:0 0 4px;color:var(--river)}
+.sub{margin:0 0 18px;color:var(--muted);font-size:.92rem}
+label{display:block;font-weight:600;font-size:.9rem;margin:12px 0 4px}
+select,input{width:100%;padding:8px;border:1px solid var(--line);border-radius:4px;font:inherit;background:#fff}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+button{margin-top:14px;width:100%;padding:10px;border:0;border-radius:4px;background:var(--river);color:#fff;font:600 1rem var(--font);cursor:pointer}
+button.alt{background:#fff;color:var(--river);border:1px solid var(--river)}
+button:disabled{opacity:.5;cursor:wait}
+:focus-visible{outline:3px solid #f2a900;outline-offset:2px}
+#status{margin:14px 0 0;font-size:.9rem;min-height:1.3em}#status.err{color:var(--alert)}
+.legend span{display:inline-flex;align-items:center;gap:6px;margin:8px 12px 0 0;font-size:.85rem}
+.legend i{width:12px;height:12px;border-radius:2px}
+table{width:100%;border-collapse:collapse;margin-top:10px;font-size:.88rem}
+th,td{text-align:left;padding:5px 4px;border-bottom:1px solid var(--line)}td:last-child,th:last-child{text-align:right}
+tr.chg td{font-weight:600}
+#demo{background:#fff3cd;border:1px solid #e0b84a;padding:8px 10px;border-radius:4px;font-size:.85rem;margin-bottom:12px}
+#map{height:100%;min-height:100vh}
+@media(max-width:760px){body{grid-template-columns:1fr}#map{min-height:60vh}}
+</style>
+</head>
+<body>
+<aside>
+  <div id="demo" hidden><b>Demo mode.</b> Sample data only. These maps and numbers are invented to show the interface, not real results.</div>
+  <h1>LandWatch Assam</h1>
+  <p class="sub">Choose an area, the satellite data and two years. Compare how land cover changed.</p>
+  <label for="district">District</label><select id="district"></select>
+  <label for="dataset">Satellite data</label><select id="dataset"></select>
+  <div class="row">
+    <div><label for="t1">Earlier year (T1)</label><input id="t1" type="number" value="2020"></div>
+    <div><label for="t2">Later year (T2)</label><input id="t2" type="number" value="2024"></div>
+  </div>
+  <label for="conf">Minimum confidence: <span id="confv">0.6</span></label>
+  <input id="conf" type="range" min="0.3" max="0.95" step="0.05" value="0.6">
+  <button id="analyze">Detect land cover change</button>
+  <button id="preview" class="alt">Preview satellite image for T2</button>
+  <p id="status" role="status"></p>
+  <div class="legend" id="legend"></div>
+  <table id="matrix" hidden><thead><tr><th>From</th><th>To</th><th>Hectares</th></tr></thead><tbody></tbody></table>
+</aside>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const API = window.API_BASE || "http://localhost:8000";
+const $ = id => document.getElementById(id);
+const map = L.map("map").setView([26.2, 92.9], 7);
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {attribution: "© OpenStreetMap contributors"}).addTo(map);
+let overlays = [], control = null;
+
+// ---- Demo mode: open index.html?demo to use sample data without a backend ----
+const DEMO = new URLSearchParams(location.search).has("demo");
+const DEMO_COLORS = ["#9aa0a6", "#d1493f", "#e6c35c", "#2f6b3a", "#b79f84", "#5db7a6", "#1f5fa8", "#8d6bb8"];
+const DEMO_NAMES = ["Uncertain", "Built-up", "Agriculture", "Forest", "Wasteland", "Wetland", "Water", "Other"];
+const DEMO_DISTRICTS = {"Kamrup Metropolitan": [26.14, 91.74], "Jorhat": [26.75, 94.2], "Dibrugarh": [27.48, 94.9],
+  "Cachar": [24.83, 92.78], "Karbi Anglong": [25.84, 93.43], "Sonitpur": [26.63, 92.8]};
+function demoClass(lat, lon, year) {
+  const n = (Math.sin(lat * 55) + Math.sin(lon * 47) + Math.sin((lat + lon) * 31) + Math.sin((lat - lon) * 19)) / 4;
+  let c = n < -0.55 ? 6 : n < -0.3 ? 5 : n < 0.05 ? 2 : n < 0.45 ? 3 : 4;
+  if (Math.sin(lat * 210) * Math.sin(lon * 190) > 0.86) c = 1;
+  if (year >= 2023) {
+    const m = Math.sin(lat * 130 + 1) * Math.sin(lon * 120 + 2);
+    if (m > 0.8 && c === 3) c = 2;
+    if (m > 0.9 && c === 2) c = 1;
+  }
+  if (Math.sin(lat * 300) * Math.sin(lon * 280) > 0.93) c = 0;
+  return c;
+}
+function demoLayer(spec) {
+  const Layer = L.GridLayer.extend({createTile(co) {
+    const t = document.createElement("canvas"); t.width = t.height = 256;
+    const g = t.getContext("2d"), step = 8;
+    for (let x = 0; x < 256; x += step) for (let y = 0; y < 256; y += step) {
+      const p = map.unproject(L.point(co.x * 256 + x + step / 2, co.y * 256 + y + step / 2), co.z);
+      let color;
+      if (spec.kind === "classes") color = DEMO_COLORS[demoClass(p.lat, p.lng, spec.year)];
+      else if (spec.kind === "change") {
+        if (demoClass(p.lat, p.lng, spec.t1) === demoClass(p.lat, p.lng, spec.t2)) continue;
+        color = "#ff0033";
+      } else color = ["#6b7a5a", "#a39a8a", "#8fa36b", "#4f6f45", "#b5a58a", "#6f8f86", "#35566e", "#a39a8a"][demoClass(p.lat, p.lng, 2024)];
+      g.fillStyle = color; g.fillRect(x, y, step, step);
+    }
+    return t;
+  }});
+  return new Layer({opacity: 0.75});
+}
+async function demoApi(path, body) {
+  await new Promise(r => setTimeout(r, path.includes("analyze") ? 1500 : 500));
+  if (path === "/api/districts") return Object.keys(DEMO_DISTRICTS);
+  if (path === "/api/datasets") return [{id: "sentinel2", label: "Sentinel-2 (optical)"}, {id: "sentinel1", label: "Sentinel-1 (radar)"}, {id: "fused", label: "Sentinel-2 + Sentinel-1 (fused)"}];
+  const [la, lo] = DEMO_DISTRICTS[body.district], bounds = [[la - .4, lo - .4], [la + .4, lo + .4]];
+  if (path === "/api/preview") return {layers: {"Demo satellite image": {kind: "imagery"}}, bounds};
+  const k = 0.6 + body.district.length / 40;
+  const rows = [["Forest", "Forest", 41200], ["Agriculture", "Agriculture", 33800], ["Water", "Water", 9100], ["Wetland", "Wetland", 3600],
+    ["Built-up", "Built-up", 2100], ["Forest", "Agriculture", 1850], ["Agriculture", "Built-up", 720], ["Wetland", "Agriculture", 410],
+    ["Water", "Wetland", 260], ["Forest", "Wasteland", 190]];
+  return {
+    layers: {[`Classes ${body.t1_year}`]: {kind: "classes", year: body.t1_year}, [`Classes ${body.t2_year}`]: {kind: "classes", year: body.t2_year},
+      "Significant change": {kind: "change", t1: body.t1_year, t2: body.t2_year}},
+    bounds, matrix: rows.map(([f, t, h]) => ({from: f, to: t, hectares: Math.round(h * k)})),
+    classes: DEMO_COLORS.map((c, i) => ({name: DEMO_NAMES[i], color: c}))
+  };
+}
+if (DEMO) $("demo").hidden = false;
+
+async function api(path, body) {
+  if (DEMO) return demoApi(path, body);
+  const res = await fetch(API + path, body ? {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)} : {});
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || res.statusText);
+  return res.json();
+}
+function status(msg, err) { const s = $("status"); s.textContent = msg; s.className = err ? "err" : ""; }
+function showLayers(data) {
+  overlays.forEach(l => map.removeLayer(l)); if (control) control.remove();
+  const named = {}; overlays = [];
+  Object.entries(data.layers).forEach(([name, url], i) => {
+    const l = typeof url === "string" ? L.tileLayer(url, {maxZoom: 18}) : demoLayer(url); named[name] = l; overlays.push(l); if (i === 0) l.addTo(map);
+  });
+  control = L.control.layers(null, named, {collapsed: false}).addTo(map);
+  map.fitBounds(data.bounds);
+}
+function showResults(data) {
+  $("legend").innerHTML = (data.classes || []).map(c => `<span><i style="background:${c.color}"></i>${c.name}</span>`).join("");
+  const rows = (data.matrix || []).sort((a, b) => b.hectares - a.hectares);
+  $("matrix").hidden = !rows.length;
+  $("matrix").tBodies[0].innerHTML = rows.map(r => `<tr class="${r.from !== r.to ? "chg" : ""}"><td>${r.from}</td><td>${r.to}</td><td>${r.hectares.toLocaleString()}</td></tr>`).join("");
+}
+async function run(btn, label, fn) {
+  btn.disabled = true; status(label);
+  try { await fn(); status("Done. Use the layer list on the map to switch views."); }
+  catch (e) { status("Could not finish: " + e.message, true); }
+  btn.disabled = false;
+}
+$("conf").oninput = e => $("confv").textContent = e.target.value;
+$("analyze").onclick = () => run($("analyze"), "Processing. Large districts can take a few minutes.", async () => {
+  const data = await api("/api/analyze", {district: $("district").value, dataset: $("dataset").value,
+    t1_year: +$("t1").value, t2_year: +$("t2").value, conf_threshold: +$("conf").value});
+  showLayers(data); showResults(data);
+});
+$("preview").onclick = () => run($("preview"), "Loading satellite image.", async () => {
+  const y = +$("t2").value;
+  showLayers(await api("/api/preview", {district: $("district").value, dataset: $("dataset").value, start: `${y}-10-01`, end: `${y}-12-01`}));
+});
+(async () => {
+  try {
+    const [d, ds] = await Promise.all([api("/api/districts"), api("/api/datasets")]);
+    $("district").innerHTML = d.map(x => `<option>${x}</option>`).join("");
+    $("dataset").innerHTML = ds.map(x => `<option value="${x.id}">${x.label}</option>`).join("");
+  } catch (e) { status("Cannot reach the API: " + e.message, true); }
+})();
+</script>
+</body>
+</html>
